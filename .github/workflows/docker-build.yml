@@ -61,20 +61,32 @@ jobs:
           echo "::group::config set/get key paths used by the Railway start command"
           docker run --rm -e OPENCLAW_STATE_DIR=/tmp/state -e HOME=/tmp "$IMG" bash -euo pipefail -c '
             A=citest
+            # Replay the exact key/value shapes the Railway start command
+            # uses at boot (types matter: allowFrom is an array, allowBots and
+            # nativeStreaming are booleans, policies are enums).
             # v2026.9.4 redacts secret-shaped values on `config get`
-            # (__OPENCLAW_REDACTED__). For those keys a non-empty readback is
-            # the assertion; the literal value is deliberately unreadable.
-            for k in name botToken appToken allowFrom allowBots dmPolicy groupPolicy streaming nativeStreaming; do
-              openclaw config set "channels.slack.accounts.$A.$k" "ci-dummy" >/dev/null \
-                || { echo "FAIL: config set channels.slack.accounts.<agent>.$k"; exit 1; }
+            # (__OPENCLAW_REDACTED__), so for those a non-empty readback is the
+            # assertion; the literal value is deliberately unreadable.
+            set_key() {
+              k="$1"; v="$2"
+              openclaw config set "channels.slack.accounts.$A.$k" "$v" >/dev/null \
+                || { echo "FAIL: config set channels.slack.accounts.<agent>.$k ($v)"; exit 1; }
               got="$(openclaw config get "channels.slack.accounts.$A.$k" 2>/dev/null || true)"
               case "$got" in
-                *ci-dummy*)            echo "  ok  channels.slack.accounts.<agent>.$k" ;;
-                *OPENCLAW_REDACTED*)   echo "  ok  channels.slack.accounts.<agent>.$k (redacted on read)" ;;
-                "")                    echo "FAIL: empty readback channels.slack.accounts.<agent>.$k"; exit 1 ;;
-                *)                     echo "FAIL: unexpected readback channels.slack.accounts.<agent>.$k (got: $got)"; exit 1 ;;
+                "")                  echo "FAIL: empty readback channels.slack.accounts.<agent>.$k"; exit 1 ;;
+                *OPENCLAW_REDACTED*) echo "  ok  channels.slack.accounts.<agent>.$k (redacted on read)" ;;
+                *)                   echo "  ok  channels.slack.accounts.<agent>.$k" ;;
               esac
-            done
+            }
+            set_key name            "CI Test"
+            set_key botToken        "xoxb-ci-dummy"
+            set_key appToken        "xapp-ci-dummy"
+            set_key allowFrom       '"'"'["U0AN74BRCKV"]'"'"'
+            set_key allowBots       false
+            set_key dmPolicy        "allowlist"
+            set_key groupPolicy     "open"
+            set_key streaming       "partial"
+            set_key nativeStreaming true
             openclaw config get agents.list >/dev/null || { echo "FAIL: config get agents.list"; exit 1; }
             echo "  ok  agents.list"
           '

@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch: {}
 
 jobs:
   docker-build:
@@ -17,12 +18,74 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Build only (no push). If this fails, the PR breaks container builds.
+      # Fork note (hansic21): pinned to the ref we actually deploy on Railway.
       - name: Build Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: false
+          load: true
+          build-args: |
+            OPENCLAW_GIT_REF=v2026.9.4
           tags: openclaw-railway-template:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # ── Fork-only gate ───────────────────────────────────────────────
+      # The Railway start command drives openclaw through these exact CLI
+      # paths on every boot. A silent schema drift here = bots boot, look
+      # healthy, and quietly lose their Slack wiring. Assert them here,
+      # outside the maintenance window, for free.
+      - name: Verify runtime + start-command CLI contract
+        run: |
+          set -euo pipefail
+          IMG=openclaw-railway-template:ci
+          run() { docker run --rm -e OPENCLAW_STATE_DIR=/tmp/state -e HOME=/tmp "$IMG" "$@"; }
+
+          echo "::group::node / openclaw version"
+          run node --version
+          run openclaw --version
+          echo "::endgroup::"
+
+          echo "::group::node engine satisfies openclaw engines"
+          docker run --rm "$IMG" node -e '
+            const semver_major = process.versions.node.split(".").map(Number);
+            const [maj, min] = semver_major;
+            const ok = (maj === 24 && min >= 16) || maj >= 26;
+            if (!ok) { console.error("node " + process.versions.node + " violates openclaw engines"); process.exit(1); }
+            console.log("node " + process.versions.node + " OK");
+          '
+          echo "::endgroup::"
+
+          echo "::group::config set/get key paths used by the Railway start command"
+          docker run --rm -e OPENCLAW_STATE_DIR=/tmp/state -e HOME=/tmp "$IMG" bash -euo pipefail -c '
+            A=citest
+            for k in name botToken appToken allowFrom allowBots dmPolicy groupPolicy streaming nativeStreaming; do
+              openclaw config set "channels.slack.accounts.$A.$k" "ci-dummy" >/dev/null \
+                || { echo "FAIL: config set channels.slack.accounts.<agent>.$k"; exit 1; }
+              got="$(openclaw config get "channels.slack.accounts.$A.$k" 2>/dev/null || true)"
+              case "$got" in *ci-dummy*) ;; *) echo "FAIL: readback channels.slack.accounts.<agent>.$k (got: $got)"; exit 1;; esac
+              echo "  ok  channels.slack.accounts.<agent>.$k"
+            done
+            openclaw config get agents.list >/dev/null || { echo "FAIL: config get agents.list"; exit 1; }
+            echo "  ok  agents.list"
+          '
+          echo "::endgroup::"
+
+          echo "::group::agents subcommands + flags used at boot"
+          docker run --rm -e OPENCLAW_STATE_DIR=/tmp/state -e HOME=/tmp "$IMG" bash -euo pipefail -c '
+            mkdir -p /tmp/ws /tmp/agentdir
+            openclaw agents add citest --workspace /tmp/ws --agent-dir /tmp/agentdir --non-interactive \
+              || { echo "FAIL: agents add --workspace/--agent-dir/--non-interactive"; exit 1; }
+            echo "  ok  agents add"
+            openclaw agents bind --agent citest --bind slack:citest \
+              || { echo "FAIL: agents bind --agent/--bind"; exit 1; }
+            echo "  ok  agents bind"
+            openclaw agents set-identity --agent citest --name "리키CI" --emoji "🎸" \
+              || { echo "FAIL: agents set-identity --agent/--name/--emoji"; exit 1; }
+            echo "  ok  agents set-identity"
+          '
+          echo "::endgroup::"
+
+          echo "ALL START-COMMAND CLI PATHS VALID ON THIS IMAGE"

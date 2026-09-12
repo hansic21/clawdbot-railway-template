@@ -89,7 +89,13 @@ jobs:
             # start command still sets the legacy string and now fails
             # validation. Contract replays the FIX shape, not the old one.
             set_key streaming.mode  "partial"
-            set_key nativeStreaming true
+            # v2026.9.4: `nativeStreaming` was REMOVED from the account
+            # schema (strict: "must not have additional properties").
+            # The canon start command still sets it; the fix is to drop
+            # the line. Contract asserts the key is now rejected.
+            openclaw config set "channels.slack.accounts.$A.nativeStreaming" true >/dev/null 2>&1 \
+              && { echo "UNEXPECTED: nativeStreaming still accepted on 9.4"; exit 1; }
+            echo "  ok  nativeStreaming correctly rejected (drop the canon line)"
             openclaw config get agents.list >/dev/null || { echo "FAIL: config get agents.list"; exit 1; }
             echo "  ok  agents.list"
           '

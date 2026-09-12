@@ -85,7 +85,10 @@ jobs:
             set_key allowBots       false
             set_key dmPolicy        "allowlist"
             set_key groupPolicy     "open"
-            set_key streaming       "partial"
+            # v2026.9.4: `streaming` became an object ({mode:…}); the canon
+            # start command still sets the legacy string and now fails
+            # validation. Contract replays the FIX shape, not the old one.
+            set_key streaming.mode  "partial"
             set_key nativeStreaming true
             openclaw config get agents.list >/dev/null || { echo "FAIL: config get agents.list"; exit 1; }
             echo "  ok  agents.list"

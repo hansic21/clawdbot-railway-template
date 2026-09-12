@@ -96,8 +96,15 @@ jobs:
             openclaw config set "channels.slack.accounts.$A.nativeStreaming" true >/dev/null 2>&1 \
               && { echo "UNEXPECTED: nativeStreaming still accepted on 9.4"; exit 1; }
             echo "  ok  nativeStreaming correctly rejected (drop the canon line)"
-            openclaw config get agents.list >/dev/null || { echo "FAIL: config get agents.list"; exit 1; }
-            echo "  ok  agents.list"
+            # v2026.9.4: `agents.list` (array) became `agents.entries`
+            # (object keyed by agent id). The canon start command still
+            # computes an index into agents.list; the fix is a direct
+            # entries.<id> write, no index needed.
+            openclaw config get agents.list >/dev/null 2>&1 \
+              && { echo "UNEXPECTED: agents.list still valid on 9.4"; exit 1; }
+            openclaw config set "agents.entries.$A.groupChat.mentionPatterns" '"'"'["CI"]'"'"' >/dev/null \
+              || { echo "FAIL: config set agents.entries.<id>.groupChat.mentionPatterns"; exit 1; }
+            echo "  ok  agents.entries.<id>.groupChat.mentionPatterns"
           '
           echo "::endgroup::"
 

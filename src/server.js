@@ -140,6 +140,85 @@ let gatewayStarting = null;
 // Debug breadcrumbs for common Railway failures (502 / "Application failed to respond").
 let lastGatewayError = null;
 let lastGatewayExit = null;
+
+// --- gateway supervisor (2026-09-13 인시던트) ---------------------------------
+// 게이트웨이 자식이 죽어도 PID1은 살아 있다. Railway restartPolicy는 PID1만 보고,
+// healthcheckPath(/setup/healthz)는 상태와 무관하게 ok를 돌려준다. 그래서 2026-09-13에
+// 게이트웨이가 WAL sidecar 불일치로 자살한 뒤 6시간 26분 동안 아무도 모른 채
+// 슬랙 9봇이 전부 침묵했다. 재기동 기계(ensureGatewayRunning)는 이미 있었고,
+// exit 이벤트가 그것을 부르지 않은 것이 유일한 결함이었다.
+const RESPAWN_BASE_MS = Number(process.env.OPENCLAW_RESPAWN_BASE_MS || 2_000);
+const RESPAWN_MAX_MS = Number(process.env.OPENCLAW_RESPAWN_MAX_MS || 60_000);
+const RESPAWN_MAX_ATTEMPTS = Number(process.env.OPENCLAW_RESPAWN_MAX_ATTEMPTS || 10);
+// 이 시간 이상 살아 있었으면 건강했던 것으로 보고 백오프 카운터를 리셋한다.
+const RESPAWN_HEALTHY_MS = Number(process.env.OPENCLAW_RESPAWN_HEALTHY_MS || 5 * 60 * 1000);
+
+let gatewayStartedAt = 0;
+let respawnAttempts = 0;
+let respawnTimer = null;
+let respawnHalted = false;
+// 의도적 중단(gateway.stop·onboard·restore·SIGTERM)은 되살리지 않는다.
+let suppressRespawnUntil = 0;
+
+function stopGatewayIntentionally() {
+  suppressRespawnUntil = Date.now() + 30_000;
+  if (respawnTimer) {
+    clearTimeout(respawnTimer);
+    respawnTimer = null;
+  }
+  if (!gatewayProc) return;
+  try {
+    gatewayProc.kill("SIGTERM");
+  } catch {
+    // best effort
+  }
+}
+
+function scheduleGatewayRespawn(exitInfo) {
+  if (respawnTimer) return;
+  if (Date.now() < suppressRespawnUntil) {
+    console.error("[gateway-supervisor] intentional stop - 재기동하지 않는다");
+    return;
+  }
+  if (!isConfigured()) return;
+
+  const uptimeMs = gatewayStartedAt ? Date.now() - gatewayStartedAt : 0;
+  if (uptimeMs >= RESPAWN_HEALTHY_MS) {
+    // 오래 살아 있다가 죽은 것은 크래시 루프가 아니다.
+    respawnAttempts = 0;
+    respawnHalted = false;
+  }
+  if (respawnHalted) return;
+
+  respawnAttempts += 1;
+  if (respawnAttempts > RESPAWN_MAX_ATTEMPTS) {
+    respawnHalted = true;
+    console.error(
+      `[gateway-supervisor] 재기동 ${RESPAWN_MAX_ATTEMPTS}회 연속 실패 - 중단한다. 수동 개입 필요 ` +
+        `(마지막 종료: code=${exitInfo?.code} signal=${exitInfo?.signal})`,
+    );
+    return;
+  }
+
+  const delayMs = Math.min(RESPAWN_BASE_MS * 2 ** (respawnAttempts - 1), RESPAWN_MAX_MS);
+  console.error(
+    `[gateway-supervisor] 게이트웨이 사망 감지 (code=${exitInfo?.code} signal=${exitInfo?.signal}, ` +
+      `uptime=${Math.round(uptimeMs / 1000)}s) - ${delayMs}ms 뒤 재기동 시도 ` +
+      `${respawnAttempts}/${RESPAWN_MAX_ATTEMPTS}`,
+  );
+
+  respawnTimer = setTimeout(() => {
+    respawnTimer = null;
+    ensureGatewayRunning()
+      .then(() => console.error("[gateway-supervisor] 재기동 성공"))
+      .catch((err) => {
+        console.error(`[gateway-supervisor] 재기동 실패: ${String(err)}`);
+        scheduleGatewayRespawn(exitInfo);
+      });
+  }, delayMs);
+  if (typeof respawnTimer.unref === "function") respawnTimer.unref();
+}
+// -----------------------------------------------------------------------------
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 
@@ -191,6 +270,7 @@ async function startGateway() {
     OPENCLAW_GATEWAY_TOKEN,
   ];
 
+  gatewayStartedAt = Date.now();
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
@@ -212,6 +292,7 @@ async function startGateway() {
     console.error(msg);
     lastGatewayExit = { code, signal, at: new Date().toISOString() };
     gatewayProc = null;
+    scheduleGatewayRespawn({ code, signal });
   });
 }
 
@@ -259,11 +340,7 @@ async function ensureGatewayRunning() {
 
 async function restartGateway() {
   if (gatewayProc) {
-    try {
-      gatewayProc.kill("SIGTERM");
-    } catch {
-      // ignore
-    }
+    stopGatewayIntentionally();
     // Give it a moment to exit and release the port.
     await sleep(750);
     gatewayProc = null;
@@ -337,8 +414,12 @@ app.get("/healthz", async (_req, res) => {
     }
   }
 
-  res.json({
-    ok: true,
+  // 설정이 끝난 상태에서 게이트웨이에 닿지 않으면 200을 돌려주면 안 된다.
+  // 2026-09-13: /setup/healthz가 무조건 ok를 반환해 게이트웨이 사망이
+  // 배포 게이팅에도 외부 폴링에도 전혀 잡히지 않았다.
+  const degraded = isConfigured() && !gatewayReachable;
+  res.status(degraded ? 503 : 200).json({
+    ok: !degraded,
     wrapper: {
       configured: isConfigured(),
       stateDir: STATE_DIR,
@@ -1005,7 +1086,7 @@ app.post("/setup/api/console/run", requireSetupAuth, async (req, res) => {
     }
     if (cmd === "gateway.stop") {
       if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
+        stopGatewayIntentionally();
         await sleep(750);
         gatewayProc = null;
       }
@@ -1151,7 +1232,7 @@ app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
     // Stop gateway to avoid running gateway + onboard concurrently on small Railway instances.
     try {
       if (gatewayProc) {
-        try { gatewayProc.kill("SIGTERM"); } catch {}
+        stopGatewayIntentionally();
         await sleep(750);
         gatewayProc = null;
       }
@@ -1269,7 +1350,7 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
 
     // Stop gateway before restore so we don't overwrite live files.
     if (gatewayProc) {
-      try { gatewayProc.kill("SIGTERM"); } catch {}
+      stopGatewayIntentionally();
       await sleep(750);
       gatewayProc = null;
     }
@@ -1480,11 +1561,7 @@ server.on("upgrade", async (req, socket, head) => {
 
 process.on("SIGTERM", () => {
   // Best-effort shutdown
-  try {
-    if (gatewayProc) gatewayProc.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
+  stopGatewayIntentionally();
 
   // Stop accepting new connections; allow in-flight requests to complete briefly.
   try {
